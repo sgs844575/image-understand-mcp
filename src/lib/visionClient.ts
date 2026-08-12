@@ -25,6 +25,10 @@ interface ChatCompletionResponse {
     message?: {
       content?: string | Array<{ type?: string; text?: string }>;
     };
+    delta?: {
+      content?: string;
+      reasoning_content?: string;
+    };
   }>;
   error?: { message?: string };
 }
@@ -41,6 +45,45 @@ function extractText(body: ChatCompletionResponse): string {
       .join("");
   }
   return "";
+}
+
+/**
+ * 判断响应是否为 SSE 流式格式。
+ * 部分中转网关（如 ai.chatboxai.app）即使请求未带 stream: true，
+ * 也会强制返回 text/event-stream，因此除了 Content-Type 还要看
+ * 响应体是否以 "data:" 开头。
+ */
+function isSseResponse(rawText: string, contentType: string | null): boolean {
+  return (contentType ?? "").includes("text/event-stream") || rawText.trimStart().startsWith("data:");
+}
+
+/**
+ * 解析 SSE 流式响应（`data: {json}\n\n` 行序列），拼装 delta.content 文本。
+ * 推理模型的 reasoning_content（思考过程）不属于最终答案，不拼入结果；
+ * `data: [DONE]` 表示流结束；流内嵌的 error 会被收集并抛出。
+ */
+function extractStreamedText(rawText: string): string {
+  let text = "";
+  for (const line of rawText.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      const chunk = JSON.parse(payload) as ChatCompletionResponse;
+      if (chunk.error?.message) {
+        throw new VisionApiError(`视觉模型返回错误：${chunk.error.message}`);
+      }
+      const delta = chunk.choices?.[0]?.delta;
+      if (typeof delta?.content === "string") {
+        text += delta.content;
+      }
+    } catch (err) {
+      if (err instanceof VisionApiError) throw err;
+      // 忽略无法解析的行（例如心跳注释），继续处理后续分块
+    }
+  }
+  return text;
 }
 
 export async function describeImage({ provider, dataUri, prompt }: DescribeImageParams): Promise<string> {
@@ -83,6 +126,16 @@ export async function describeImage({ provider, dataUri, prompt }: DescribeImage
   }
 
   const rawText = await response.text();
+
+  // 上游可能强制返回 SSE 流式响应（即使请求未带 stream: true），先识别再解析
+  if (isSseResponse(rawText, response.headers.get("content-type"))) {
+    const text = extractStreamedText(rawText).trim();
+    if (!text) {
+      throw new VisionApiError(`视觉模型 "${provider.name}" 返回了空结果`);
+    }
+    return text;
+  }
+
   let body: ChatCompletionResponse;
   try {
     body = JSON.parse(rawText) as ChatCompletionResponse;

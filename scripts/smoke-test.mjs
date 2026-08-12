@@ -30,6 +30,29 @@ const mockServer = createServer((req, res) => {
   req.on("data", (chunk) => (body += chunk));
   req.on("end", () => {
     receivedRequestBody = JSON.parse(body);
+    const messages = receivedRequestBody.messages ?? [];
+    const promptText = Array.isArray(messages[0]?.content)
+      ? messages[0].content[0]?.text ?? ""
+      : messages[0]?.content ?? "";
+
+    // 模拟真实中转网关：prompt 含 "SSE" 标记时强制返回 text/event-stream 流式响应
+    // （即使请求体没有 stream: true，例如 ai.chatboxai.app 的行为）
+    if (promptText.includes("SSE")) {
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+      const chunk = (delta, finishReason = null) =>
+        `data: ${JSON.stringify({
+          choices: [{ index: 0, delta, finish_reason: finishReason }],
+          object: "chat.completion.chunk",
+        })}\n\n`;
+      res.write(chunk({ role: "assistant" }));
+      res.write(chunk({ reasoning_content: "思考过程（解析时应被忽略）" }));
+      res.write(chunk({ content: "这是从流式响应中拼出的红色图片描述" }));
+      res.write(chunk({}, "stop"));
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
+
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
@@ -86,6 +109,15 @@ check("understand_image 返回了 mock 的描述文本", imageResult.content[0].
 check("发往视觉模型的请求包含 image_url data URI", JSON.stringify(receivedRequestBody).includes("data:image/png;base64,"));
 check("发往视觉模型的请求携带了自定义 prompt", JSON.stringify(receivedRequestBody).includes("这张图是什么颜色"));
 check("发往视觉模型的请求使用了配置的 model 名", receivedRequestBody.model === "mock-vision-model");
+
+// 上游强制返回 SSE 流式响应（请求未带 stream: true）时也应能正常解析
+const sseResult = await client.callTool({
+  name: "understand_image",
+  arguments: { image: imagePath, prompt: "请用流式(SSE)方式返回，这张图是什么颜色？" },
+});
+check("SSE 流式响应调用未报错", sseResult.isError !== true);
+check("SSE 流式响应返回了拼装后的文本", sseResult.content[0].text.includes("响应中拼出的"));
+check("SSE 解析结果不包含 reasoning_content 推理过程", !sseResult.content[0].text.includes("思考过程"));
 
 // 测试错误路径：不存在的本地文件
 const errorResult = await client.callTool({
